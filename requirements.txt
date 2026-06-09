@@ -1,5 +1,7 @@
-fastapi==0.109.2
-uvicorn==0.27.1
+fastapi
+uvicorn[standard]
 appwrite
-pandas==2.2.0
-python-dotenv==1.0.1
+pandas
+python-dotenv
+cloudinary
+python-multipart
