@@ -1,0 +1,10 @@
+t=2026-06-09T18:11:02+0530 lvl=info msg="no configuration paths supplied"
+t=2026-06-09T18:11:02+0530 lvl=warn msg="ngrok config file found at both XDG and legacy locations, using XDG location" xdg_path="/Users/sreemadhav/Library/Application Support/ngrok/ngrok.yml" legacy_path=/Users/sreemadhav/.ngrok2/ngrok.yml
+t=2026-06-09T18:11:02+0530 lvl=info msg="using configuration at default config path" path="/Users/sreemadhav/Library/Application Support/ngrok/ngrok.yml"
+t=2026-06-09T18:11:02+0530 lvl=info msg="open config file" path="/Users/sreemadhav/Library/Application Support/ngrok/ngrok.yml" err=nil
+t=2026-06-09T18:11:02+0530 lvl=info msg="FIPS 140 mode" enabled=false
+t=2026-06-09T18:11:02+0530 lvl=warn msg="can't bind default web address, trying alternatives" obj=web addr=127.0.0.1:4040
+t=2026-06-09T18:11:02+0530 lvl=info msg="starting web service" obj=web addr=127.0.0.1:4042 allow_hosts=[]
+t=2026-06-09T18:11:02+0530 lvl=info msg="client session established" obj=tunnels.session
+t=2026-06-09T18:11:02+0530 lvl=info msg="tunnel session started" obj=tunnels.session
+t=2026-06-09T18:11:03+0530 lvl=info msg="started tunnel" obj=tunnels name=command_line addr=http://localhost:8000 url=https://ff09-2409-40f0-1013-544c-8ca1-e571-c441-87da.ngrok-free.app

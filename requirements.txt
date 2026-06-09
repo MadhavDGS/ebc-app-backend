@@ -1,0 +1,5 @@
+fastapi==0.109.2
+uvicorn==0.27.1
+appwrite
+pandas==2.2.0
+python-dotenv==1.0.1
