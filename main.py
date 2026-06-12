@@ -142,7 +142,14 @@ def create_member(member: MemberCreate):
                 'area': data['location'],
                 'bio': data['bio'],
                 'tags': data['tags'],
-                'avatar': data['avatar_url']
+                'avatar': data['avatar_url'],
+                'whyJoined': '',
+                'whatTheyExpect': '',
+                'howTheyCanHelp': '',
+                'linkedIn': '',
+                'instagram': '',
+                'portfolio': '',
+                'phone': ''
             }
         )
         m = doc_to_member(doc)
