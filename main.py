@@ -424,6 +424,174 @@ def get_reservations(meetup_id: str):
         return []
 
 
+@app.get("/api/users/{email}/reservations")
+def get_user_reservations(email: str):
+    try:
+        response = databases.list_documents(
+            database_id,
+            RESERVATIONS_COLLECTION,
+            [Query.equal('user_email', email)]
+        )
+        reservations = []
+        for doc in get_docs(response):
+            res_dict = doc_to_reservation(doc)
+            try:
+                meetup_doc = databases.get_document(database_id, MEETUPS_COLLECTION, res_dict['meetup_id'])
+                res_dict['meetup'] = doc_to_meetup(meetup_doc)
+            except Exception as e:
+                res_dict['meetup'] = None
+            reservations.append(res_dict)
+        return reservations
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class TicketScanRequest(BaseModel):
+    ticket_id: str
+    action: str = "check_in"  # "check_in" | "check_out"
+
+
+@app.post("/api/tickets/scan")
+def scan_ticket(req: TicketScanRequest):
+    ticket_id = req.ticket_id
+    action = req.action
+    if not ticket_id:
+        raise HTTPException(status_code=400, detail="Ticket ID is required")
+    
+    try:
+        response = databases.list_documents(
+            database_id, RESERVATIONS_COLLECTION,
+            [Query.equal('ticket_id', ticket_id)]
+        )
+        docs = get_docs(response)
+        if not docs:
+            raise HTTPException(status_code=404, detail="Ticket not found")
+        
+        res_doc = docs[0]
+        res_dict = doc_to_reservation(res_doc)
+        
+        new_status = 'checked_in' if action == 'check_in' else 'confirmed'
+        
+        updated_doc = databases.update_document(
+            database_id,
+            RESERVATIONS_COLLECTION,
+            res_dict['id'],
+            {
+                'status': new_status
+            }
+        )
+        
+        meetup_doc = databases.get_document(database_id, MEETUPS_COLLECTION, res_dict['meetup_id'])
+        meetup_dict = doc_to_meetup(meetup_doc)
+        
+        return {
+            "status": "success",
+            "message": f"Successfully {'checked in' if action == 'check_in' else 'checked out'} {res_dict['user_name']}",
+            "reservation": doc_to_reservation(updated_doc),
+            "meetup": meetup_dict
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def send_ticket_email(email_to: str, user_name: str, meetup_title: str, ticket_id: str, qr_url: str):
+    import os
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+
+    smtp_host = os.getenv('SMTP_HOST')
+    smtp_port = os.getenv('SMTP_PORT', '587')
+    smtp_user = os.getenv('SMTP_USER')
+    smtp_password = os.getenv('SMTP_PASSWORD')
+
+    print(f"\n=======================================================")
+    print(f"📧 [PREVIEW] Ticket Confirmation Email Generated:")
+    print(f"   To: {email_to}")
+    print(f"   Attendee Name: {user_name}")
+    print(f"   Event: {meetup_title}")
+    print(f"   Ticket ID: {ticket_id}")
+    print(f"   QR Code URL: {qr_url}")
+    print(f"=======================================================\n")
+
+    if not smtp_host or not smtp_user or not smtp_password:
+        print("⚠️ SMTP credentials missing in environment. Email transmission skipped (logged to stdout).")
+        return False
+
+    try:
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = f"Your Ticket for {meetup_title} - Perenti Pass"
+        msg['From'] = f"Perenti Community <{smtp_user}>"
+        msg['To'] = email_to
+
+        html = f"""
+        <html>
+          <body style="font-family: Arial, sans-serif; background-color: #0d0f12; color: #ffffff; padding: 20px;">
+            <div style="max-width: 500px; margin: 0 auto; background-color: #15191f; border: 1px solid #232a35; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 10px rgba(0,0,0,0.3);">
+              <div style="background-color: #03d47c; padding: 15px; text-align: center; color: #061B0F; font-weight: bold; font-size: 18px; letter-spacing: 0.05em; text-transform: uppercase;">
+                perenti pass
+              </div>
+              <div style="padding: 25px;">
+                <h2 style="color: #ffffff; margin-top: 0;">Hey {user_name}!</h2>
+                <p style="color: #a0aec0; line-height: 1.5;">Your registration for <strong>{meetup_title}</strong> is confirmed. Below is your entry pass.</p>
+                
+                <div style="border: 1px dashed #2d3748; padding: 20px; border-radius: 8px; background-color: #0d0f12; margin: 20px 0; text-align: center;">
+                  <h3 style="margin: 0 0 15px 0; color: #ffffff;">{meetup_title}</h3>
+                  <p style="color: #a0aec0; font-size: 14px; margin: 5px 0;">Show this QR code at the venue entrance:</p>
+                  
+                  <img src="{qr_url}" alt="Ticket QR Code" style="border: 8px solid #ffffff; border-radius: 6px; margin: 15px auto; display: block;" width="150" height="150" />
+                  
+                  <div style="font-family: monospace; background-color: #1a202c; color: #e2e8f0; padding: 8px; border-radius: 4px; display: inline-block; font-size: 12px; margin-top: 10px;">
+                    {ticket_id}
+                  </div>
+                </div>
+                
+                <p style="color: #a0aec0; font-size: 12px; text-align: center; margin-top: 30px;">
+                  Perenti Community &bull; Hyderabad, India
+                </p>
+              </div>
+            </div>
+          </body>
+        </html>
+        """
+
+        part = MIMEText(html, 'html')
+        msg.attach(part)
+
+        server = smtplib.SMTP(smtp_host, int(smtp_port))
+        server.starttls()
+        server.login(smtp_user, smtp_password)
+        server.sendmail(smtp_user, email_to, msg.as_string())
+        server.quit()
+        print(f"📧 Ticket email successfully sent to {email_to}")
+        return True
+    except Exception as e:
+        print(f"❌ Failed to dispatch ticket email: {e}")
+        return False
+
+
+class StatusUpdateRequest(BaseModel):
+    status: str
+
+
+@app.put("/api/reservations/{reservation_id}/status")
+def update_reservation_status(reservation_id: str, req: StatusUpdateRequest):
+    try:
+        doc = databases.update_document(
+            database_id,
+            RESERVATIONS_COLLECTION,
+            reservation_id,
+            {
+                'status': req.status
+            }
+        )
+        return doc_to_reservation(doc)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/reservations")
 def create_reservation(res: ReservationCreate):
     try:
@@ -434,6 +602,7 @@ def create_reservation(res: ReservationCreate):
         meetup_doc = databases.get_document(database_id, MEETUPS_COLLECTION, res.meetup_id)
         meetup_data = as_dict(meetup_doc).get('data', as_dict(meetup_doc))
         capacity = meetup_data.get('capacity', 60)
+        meetup_title = meetup_data.get('title', 'Perenti Meetup')
 
         existing = databases.list_documents(
             database_id, RESERVATIONS_COLLECTION,
@@ -462,6 +631,14 @@ def create_reservation(res: ReservationCreate):
                 'status': 'confirmed',
             }
         )
+
+        # Trigger confirmation email dispatch
+        try:
+            qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=150x150&data={ticket_id}"
+            send_ticket_email(res.user_email, res.user_name, meetup_title, ticket_id, qr_url)
+        except Exception as mail_err:
+            print(f"⚠️ Non-blocking email dispatch error: {mail_err}")
+
         return doc_to_reservation(doc)
     except HTTPException:
         raise
