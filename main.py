@@ -40,9 +40,14 @@ cloudinary.config(
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
+def as_dict(obj):
+    return obj if isinstance(obj, dict) else getattr(obj, 'to_dict', lambda: obj)()
+
 def doc_to_member(doc) -> dict:
     """Convert an Appwrite Document object to a plain member dict."""
-    d = doc.to_dict()
+    if not doc:
+        return {}
+    d = as_dict(doc)
     data = d.get('data', {})
     return {
         'id': d.get('$id', ''),
@@ -96,11 +101,11 @@ def login(request: LoginRequest):
             collection_id,
             [Query.equal('email', request.email)]
         )
-        docs = response.documents
+        docs = response.get('documents', [])
         if not docs:
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
-        user_dict = docs[0].to_dict()
+        user_dict = as_dict(docs[0])
         user_data = user_dict.get('data', {})
         avatar_raw = user_data.get('avatar') or ''
         return {
@@ -122,11 +127,15 @@ def login(request: LoginRequest):
 
 @app.post("/api/members")
 def create_member(member: MemberCreate):
+    import uuid
     try:
         data = member.dict()
         doc = databases.create_document(
             database_id, collection_id, 'unique()',
             {
+                'user_id': uuid.uuid4().hex,
+                'full_name': data['full_name'],
+                'role': data['profession'],
                 'name': data['full_name'],
                 'email': data['email'],
                 'profession': data['profession'],
@@ -147,7 +156,7 @@ def get_members():
     try:
         response = databases.list_documents(database_id, collection_id)
         members = []
-        for doc in response.documents:
+        for doc in response.get('documents', []):
             m = doc_to_member(doc)
             m['avatar'] = optimize_cloudinary_url(m['avatar'])
             members.append(m)
@@ -168,7 +177,7 @@ def get_member_me(email: str = None):
             [Query.equal('email', email)]
         )
         
-        docs = response.documents
+        docs = response.get('documents', [])
         if not docs:
             raise HTTPException(status_code=404, detail="Profile not found")
             
@@ -258,10 +267,10 @@ def get_messages(user1: str, user2: str):
             [Query.equal('sender_id', user2), Query.equal('receiver_id', user1), Query.limit(100)]
         )
         
-        all_docs = res1.documents + res2.documents
+        all_docs = res1.get('documents', []) + res2.get('documents', [])
         all_docs.sort(key=lambda x: x.get('timestamp', ''), reverse=False)
         
-        return [doc.to_dict() for doc in all_docs]
+        return [as_dict(doc) for doc in all_docs]
     except Exception as e:
         print(f"Error fetching messages: {e}")
         return []
@@ -283,7 +292,7 @@ def send_message(req: SendMessageRequest):
                 'timestamp': now
             }
         )
-        return doc.to_dict()
+        return as_dict(doc)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -313,7 +322,7 @@ class ReservationCreate(BaseModel):
 
 
 def doc_to_meetup(doc) -> dict:
-    d = doc.to_dict()
+    d = as_dict(doc)
     data = d.get('data', d)
     return {
         'id': d.get('$id', ''),
@@ -330,7 +339,7 @@ def doc_to_meetup(doc) -> dict:
 
 
 def doc_to_reservation(doc) -> dict:
-    d = doc.to_dict()
+    d = as_dict(doc)
     data = d.get('data', d)
     return {
         'id': d.get('$id', ''),
@@ -349,7 +358,7 @@ def doc_to_reservation(doc) -> dict:
 def get_meetups():
     try:
         response = databases.list_documents(database_id, MEETUPS_COLLECTION)
-        return [doc_to_meetup(doc) for doc in response.documents]
+        return [doc_to_meetup(doc) for doc in response.get('documents', [])]
     except Exception as e:
         return {"error": str(e), "meetups": []}
 
@@ -366,8 +375,8 @@ def get_meetup(meetup_id: str):
                 [Query.equal('meetup_id', meetup_id)]
             )
             total_seats = sum(
-                (doc.to_dict().get('data', doc.to_dict())).get('quantity', 1)
-                for doc in res.documents
+                (as_dict(doc).get('data', as_dict(doc))).get('quantity', 1)
+                for doc in res.get('documents', [])
             )
             meetup['registered_count'] = total_seats
             meetup['remaining'] = max(0, meetup['capacity'] - total_seats)
@@ -398,7 +407,7 @@ def get_reservations(meetup_id: str):
             database_id, RESERVATIONS_COLLECTION,
             [Query.equal('meetup_id', meetup_id)]
         )
-        return [doc_to_reservation(doc) for doc in response.documents]
+        return [doc_to_reservation(doc) for doc in response.get('documents', [])]
     except Exception as e:
         return []
 
@@ -411,7 +420,7 @@ def create_reservation(res: ReservationCreate):
 
         # Check capacity
         meetup_doc = databases.get_document(database_id, MEETUPS_COLLECTION, res.meetup_id)
-        meetup_data = meetup_doc.to_dict().get('data', meetup_doc.to_dict())
+        meetup_data = as_dict(meetup_doc).get('data', as_dict(meetup_doc))
         capacity = meetup_data.get('capacity', 60)
 
         existing = databases.list_documents(
@@ -419,8 +428,8 @@ def create_reservation(res: ReservationCreate):
             [Query.equal('meetup_id', res.meetup_id)]
         )
         total_booked = sum(
-            (d.to_dict().get('data', d.to_dict())).get('quantity', 1)
-            for d in existing.documents
+            (as_dict(d).get('data', as_dict(d))).get('quantity', 1)
+            for d in existing.get('documents', [])
         )
         if total_booked + res.quantity > capacity:
             raise HTTPException(status_code=400, detail="Not enough seats remaining.")
