@@ -43,6 +43,11 @@ cloudinary.config(
 def as_dict(obj):
     return obj if isinstance(obj, dict) else getattr(obj, 'to_dict', lambda: obj)()
 
+def get_docs(response):
+    if isinstance(response, dict):
+        return response.get('documents', [])
+    return getattr(response, 'documents', [])
+
 def doc_to_member(doc) -> dict:
     """Convert an Appwrite Document object to a plain member dict."""
     if not doc:
@@ -101,7 +106,7 @@ def login(request: LoginRequest):
             collection_id,
             [Query.equal('email', request.email)]
         )
-        docs = response.get('documents', [])
+        docs = get_docs(response)
         if not docs:
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
@@ -163,7 +168,7 @@ def get_members():
     try:
         response = databases.list_documents(database_id, collection_id)
         members = []
-        for doc in response.get('documents', []):
+        for doc in get_docs(response):
             m = doc_to_member(doc)
             m['avatar'] = optimize_cloudinary_url(m['avatar'])
             members.append(m)
@@ -184,7 +189,7 @@ def get_member_me(email: str = None):
             [Query.equal('email', email)]
         )
         
-        docs = response.get('documents', [])
+        docs = get_docs(response)
         if not docs:
             raise HTTPException(status_code=404, detail="Profile not found")
             
@@ -274,7 +279,7 @@ def get_messages(user1: str, user2: str):
             [Query.equal('sender_id', user2), Query.equal('receiver_id', user1), Query.limit(100)]
         )
         
-        all_docs = res1.get('documents', []) + res2.get('documents', [])
+        all_docs = get_docs(res1) + get_docs(res2)
         all_docs.sort(key=lambda x: x.get('timestamp', ''), reverse=False)
         
         return [as_dict(doc) for doc in all_docs]
@@ -365,7 +370,7 @@ def doc_to_reservation(doc) -> dict:
 def get_meetups():
     try:
         response = databases.list_documents(database_id, MEETUPS_COLLECTION)
-        return [doc_to_meetup(doc) for doc in response.get('documents', [])]
+        return [doc_to_meetup(doc) for doc in get_docs(response)]
     except Exception as e:
         return {"error": str(e), "meetups": []}
 
@@ -383,7 +388,7 @@ def get_meetup(meetup_id: str):
             )
             total_seats = sum(
                 (as_dict(doc).get('data', as_dict(doc))).get('quantity', 1)
-                for doc in res.get('documents', [])
+                for doc in get_docs(res)
             )
             meetup['registered_count'] = total_seats
             meetup['remaining'] = max(0, meetup['capacity'] - total_seats)
@@ -414,7 +419,7 @@ def get_reservations(meetup_id: str):
             database_id, RESERVATIONS_COLLECTION,
             [Query.equal('meetup_id', meetup_id)]
         )
-        return [doc_to_reservation(doc) for doc in response.get('documents', [])]
+        return [doc_to_reservation(doc) for doc in get_docs(response)]
     except Exception as e:
         return []
 
@@ -436,7 +441,7 @@ def create_reservation(res: ReservationCreate):
         )
         total_booked = sum(
             (as_dict(d).get('data', as_dict(d))).get('quantity', 1)
-            for d in existing.get('documents', [])
+            for d in get_docs(existing)
         )
         if total_booked + res.quantity > capacity:
             raise HTTPException(status_code=400, detail="Not enough seats remaining.")
