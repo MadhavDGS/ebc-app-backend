@@ -48,7 +48,7 @@ def doc_to_member(doc) -> dict:
     if not doc:
         return {}
     d = as_dict(doc)
-    data = d.get('data', {})
+    data = d.get('data', d)
     return {
         'id': d.get('$id', ''),
         'name': data.get('name') or data.get('full_name') or '',
