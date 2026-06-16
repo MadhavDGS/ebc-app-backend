@@ -41,7 +41,13 @@ cloudinary.config(
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def as_dict(obj):
-    return obj if isinstance(obj, dict) else getattr(obj, 'to_dict', lambda: obj)()
+    if isinstance(obj, dict):
+        return obj
+    if hasattr(obj, 'to_dict'):
+        return obj.to_dict()
+    if hasattr(obj, '__dict__'):
+        return vars(obj)
+    return {}
 
 def get_docs(response):
     if isinstance(response, dict):
@@ -323,6 +329,7 @@ class MeetupCreate(BaseModel):
     banner_url: str = ""
     capacity: int = 60
     is_active: bool = True
+    price: int = 422
 
 
 class ReservationCreate(BaseModel):
@@ -331,6 +338,8 @@ class ReservationCreate(BaseModel):
     user_name: str
     quantity: int = 1
     answers: str = "{}"
+    status: str = "confirmed"        # "confirmed" or "pending_payment"
+    expires_at: str = ""             # ISO string, only used for pending_payment
 
 
 def doc_to_meetup(doc) -> dict:
@@ -346,6 +355,7 @@ def doc_to_meetup(doc) -> dict:
         'banner_url': data.get('banner_url', ''),
         'capacity': data.get('capacity', 60),
         'is_active': data.get('is_active', True),
+        'price': data.get('Price', data.get('price', 422)),
         'created_at': d.get('$createdAt', ''),
     }
 
@@ -353,15 +363,25 @@ def doc_to_meetup(doc) -> dict:
 def doc_to_reservation(doc) -> dict:
     d = as_dict(doc)
     data = d.get('data', d)
+    
+    # Calculate status based on ticket_id without needing a DB column
+    ticket = data.get('ticket_id', '')
+    if ticket == 'PENDING':
+        status = 'pending_payment'
+    elif ticket == 'REJECTED':
+        status = 'rejected'
+    else:
+        status = 'confirmed'
+
     return {
         'id': d.get('$id', ''),
         'meetup_id': data.get('meetup_id', ''),
         'user_email': data.get('user_email', ''),
         'user_name': data.get('user_name', ''),
         'quantity': data.get('quantity', 1),
-        'ticket_id': data.get('ticket_id', ''),
+        'ticket_id': ticket,
         'answers': data.get('answers', '{}'),
-        'status': data.get('status', 'confirmed'),
+        'status': status,
         'created_at': d.get('$createdAt', ''),
     }
 
@@ -403,14 +423,72 @@ def get_meetup(meetup_id: str):
 @app.post("/api/meetups")
 def create_meetup(meetup: MeetupCreate):
     try:
+        data = meetup.model_dump()
+        data['Price'] = data.pop('price', 422)
         doc = databases.create_document(
             database_id, MEETUPS_COLLECTION, 'unique()',
-            meetup.dict()
+            data
         )
         return doc_to_meetup(doc)
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.put("/api/meetups/{meetup_id}")
+def update_meetup(meetup_id: str, meetup: MeetupCreate):
+    try:
+        data = meetup.model_dump()
+        data['Price'] = data.pop('price', 422)
+        doc = databases.update_document(
+            database_id, MEETUPS_COLLECTION, meetup_id,
+            data
+        )
+        return doc_to_meetup(doc)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/reservations/pending")
+def get_pending_reservations(request_admin_email: str = ""):
+    """Return all pending_payment, expired, and rejected reservations for admin review."""
+    try:
+        all_docs = []
+        queries = [Query.limit(100)]
+        while True:
+            response = databases.list_documents(
+                database_id, RESERVATIONS_COLLECTION,
+                queries
+            )
+            docs = get_docs(response)
+            if not docs:
+                break
+            all_docs.extend(docs)
+            if len(docs) < 100:
+                break
+            # Use the last document ID as the cursor for the next page
+            last_id = docs[-1]['$id']
+            queries = [Query.limit(100), Query.cursorAfter(last_id)]
+
+        results = []
+        for doc in all_docs:
+            r = doc_to_reservation(doc)
+            if r['status'] in ('pending_payment', 'expired', 'rejected'):
+                try:
+                    meetup_doc = databases.get_document(database_id, MEETUPS_COLLECTION, r['meetup_id'])
+                    r['meetup'] = doc_to_meetup(meetup_doc)
+                except Exception:
+                    r['meetup'] = None
+                results.append(r)
+        
+        # Sort in Python to avoid Appwrite missing index errors on $createdAt
+        results.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+        return results
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/reservations/{meetup_id}")
 def get_reservations(meetup_id: str):
@@ -579,14 +657,40 @@ class StatusUpdateRequest(BaseModel):
 @app.put("/api/reservations/{reservation_id}/status")
 def update_reservation_status(reservation_id: str, req: StatusUpdateRequest):
     try:
-        doc = databases.update_document(
-            database_id,
-            RESERVATIONS_COLLECTION,
-            reservation_id,
-            {
-                'status': req.status
-            }
-        )
+        if req.status == 'confirmed':
+            import random, string
+            suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+            new_ticket_id = f"PRNT-EBC-{suffix}"
+            
+            doc = databases.update_document(
+                database_id,
+                RESERVATIONS_COLLECTION,
+                reservation_id,
+                {'ticket_id': new_ticket_id}
+            )
+            
+            # Send email
+            try:
+                res_dict = doc_to_reservation(doc)
+                meetup_doc = databases.get_document(database_id, MEETUPS_COLLECTION, res_dict['meetup_id'])
+                meetup_data = as_dict(meetup_doc).get('data', as_dict(meetup_doc))
+                meetup_title = meetup_data.get('title', 'Perenti Meetup')
+                
+                qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=150x150&data={new_ticket_id}"
+                send_ticket_email(res_dict['user_email'], res_dict['user_name'], meetup_title, new_ticket_id, qr_url)
+            except Exception as mail_err:
+                print(f"⚠️ Non-blocking email dispatch error: {mail_err}")
+                
+        elif req.status == 'rejected':
+            doc = databases.update_document(
+                database_id,
+                RESERVATIONS_COLLECTION,
+                reservation_id,
+                {'ticket_id': 'REJECTED'}
+            )
+        else:
+            raise HTTPException(status_code=400, detail="Invalid status")
+            
         return doc_to_reservation(doc)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -615,33 +719,101 @@ def create_reservation(res: ReservationCreate):
         if total_booked + res.quantity > capacity:
             raise HTTPException(status_code=400, detail="Not enough seats remaining.")
 
-        # Generate ticket ID
-        suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-        ticket_id = f"PRNT-EBC-{suffix}"
+        is_pending = res.status == 'pending_payment'
+
+        # Instead of adding a new 'status' column to the database schema, 
+        # we just save 'PENDING' in the existing 'ticket_id' column to mark it.
+        ticket_id = 'PENDING'
+        if not is_pending:
+            suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+            ticket_id = f"PRNT-EBC-{suffix}"
+
+        doc_data = {
+            'meetup_id': res.meetup_id,
+            'user_email': res.user_email,
+            'user_name': res.user_name,
+            'quantity': res.quantity,
+            'ticket_id': ticket_id,
+            'answers': res.answers,
+        }
 
         doc = databases.create_document(
-            database_id, RESERVATIONS_COLLECTION, 'unique()',
-            {
-                'meetup_id': res.meetup_id,
-                'user_email': res.user_email,
-                'user_name': res.user_name,
-                'quantity': res.quantity,
-                'ticket_id': ticket_id,
-                'answers': res.answers,
-                'status': 'confirmed',
-            }
+            database_id, RESERVATIONS_COLLECTION, 'unique()', doc_data
         )
 
-        # Trigger confirmation email dispatch
-        try:
-            qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=150x150&data={ticket_id}"
-            send_ticket_email(res.user_email, res.user_name, meetup_title, ticket_id, qr_url)
-        except Exception as mail_err:
-            print(f"⚠️ Non-blocking email dispatch error: {mail_err}")
+        # Send confirmation email only for immediately confirmed reservations
+        if not is_pending and ticket_id != 'PENDING':
+            try:
+                qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=150x150&data={ticket_id}"
+                send_ticket_email(res.user_email, res.user_name, meetup_title, ticket_id, qr_url)
+            except Exception as mail_err:
+                print(f"⚠️ Non-blocking email dispatch error: {mail_err}")
 
         return doc_to_reservation(doc)
     except HTTPException:
         raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Admin Approval Endpoints ─────────────────────────────────────────────────
+
+ADMIN_EMAILS = [
+    'admin@perenti.com', 'sreemadhav@gmail.com',
+    'madhav@ebc.com', 'shiva24.santosh@gmail.com'
+]
+
+
+
+
+@app.put("/api/reservations/{reservation_id}/approve")
+def approve_reservation(reservation_id: str):
+    """Admin approves a pending_payment reservation — generates ticket_id and confirms."""
+    try:
+        import random, string
+
+        doc = databases.get_document(database_id, RESERVATIONS_COLLECTION, reservation_id)
+        res_dict = doc_to_reservation(doc)
+
+        if res_dict['status'] not in ('pending_payment',):
+            raise HTTPException(status_code=400, detail=f"Reservation is not pending (status={res_dict['status']})")
+
+        # Generate ticket ID now
+        suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        ticket_id = f"PRNT-EBC-{suffix}"
+
+        updated_doc = databases.update_document(
+            database_id, RESERVATIONS_COLLECTION, reservation_id,
+            {'status': 'confirmed', 'ticket_id': ticket_id}
+        )
+
+        # Send confirmation email
+        try:
+            meetup_doc = databases.get_document(database_id, MEETUPS_COLLECTION, res_dict['meetup_id'])
+            meetup_title = as_dict(meetup_doc).get('data', as_dict(meetup_doc)).get('title', 'EBC Meetup')
+            qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=150x150&data={ticket_id}"
+            send_ticket_email(res_dict['user_email'], res_dict['user_name'], meetup_title, ticket_id, qr_url)
+        except Exception as mail_err:
+            print(f"⚠️ Non-blocking email dispatch error: {mail_err}")
+
+        return doc_to_reservation(updated_doc)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/reservations/{reservation_id}/reject")
+def reject_reservation(reservation_id: str):
+    """Admin rejects a pending_payment reservation."""
+    try:
+        updated_doc = databases.update_document(
+            database_id, RESERVATIONS_COLLECTION, reservation_id,
+            {'ticket_id': 'REJECTED'}
+        )
+        return doc_to_reservation(updated_doc)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
