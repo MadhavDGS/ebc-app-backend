@@ -1,3 +1,7 @@
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", module="appwrite")
+
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from appwrite.client import Client
@@ -7,6 +11,9 @@ from pydantic import BaseModel
 import os
 import cloudinary
 import cloudinary.uploader
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -172,12 +179,42 @@ def create_member(member: MemberCreate):
 @app.get("/api/members")
 def get_members():
     try:
-        response = databases.list_documents(database_id, collection_id)
+        # 1. Fetch all reservations to find approved emails
+        approved_emails = set()
+        req_queries = [Query.limit(100)]
+        while True:
+            res_response = databases.list_documents(
+                database_id, RESERVATIONS_COLLECTION, req_queries
+            )
+            docs = get_docs(res_response)
+            if not docs:
+                break
+            for d in docs:
+                data = as_dict(d).get('data', as_dict(d))
+                tid = data.get('ticket_id', '')
+                if tid and tid not in ('PENDING', 'REJECTED'):
+                    approved_emails.add(data.get('user_email'))
+            if len(docs) < 100:
+                break
+            req_queries = [Query.limit(100), Query.cursorAfter(docs[-1]['$id'])]
+
+        # 2. Fetch all members and filter
         members = []
-        for doc in get_docs(response):
-            m = doc_to_member(doc)
-            m['avatar'] = optimize_cloudinary_url(m['avatar'])
-            members.append(m)
+        mem_queries = [Query.limit(100)]
+        while True:
+            response = databases.list_documents(database_id, collection_id, mem_queries)
+            docs = get_docs(response)
+            if not docs:
+                break
+            for doc in docs:
+                m = doc_to_member(doc)
+                if m.get('email') in approved_emails:
+                    m['avatar'] = optimize_cloudinary_url(m['avatar'])
+                    members.append(m)
+            if len(docs) < 100:
+                break
+            mem_queries = [Query.limit(100), Query.cursorAfter(docs[-1]['$id'])]
+            
         return members
     except Exception as e:
         return {"error": str(e)}
@@ -200,6 +237,62 @@ def get_member_me(email: str = None):
             raise HTTPException(status_code=404, detail="Profile not found")
             
         m = doc_to_member(docs[0])
+        m['avatar'] = optimize_cloudinary_url(m['avatar'])
+        return m
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.put("/api/members/{email}")
+def update_member_by_email(email: str, payload: dict):
+    try:
+        # Find the user by email
+        # Find the user by email
+        response = databases.list_documents(
+            database_id,
+            collection_id,
+            [Query.equal('email', email)]
+        )
+        docs = get_docs(response)
+        if not docs:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        
+        doc_dict = as_dict(docs[0])
+        doc_id = doc_dict.get('$id')
+        if not doc_id:
+            raise HTTPException(status_code=500, detail="Missing document ID")
+            
+        # Prepare the update data mapping
+        update_data = {}
+        if 'full_name' in payload:
+            update_data['name'] = payload['full_name']
+            update_data['full_name'] = payload['full_name']
+        if 'profession' in payload:
+            update_data['role'] = payload['profession']
+            update_data['profession'] = payload['profession']
+        # Company attribute doesn't exist in the database schema yet
+        # if 'company' in payload:
+        #     update_data['company'] = payload['company']
+        if 'location' in payload:
+            update_data['area'] = payload['location']
+        if 'bio' in payload:
+            update_data['bio'] = payload['bio']
+        if 'linkedin' in payload:
+            update_data['linkedIn'] = payload['linkedin']
+        if 'instagram' in payload:
+            update_data['instagram'] = payload['instagram']
+            
+        # Update the document
+        updated_doc = databases.update_document(
+            database_id,
+            collection_id,
+            doc_id,
+            update_data
+        )
+        
+        m = doc_to_member(updated_doc)
         m['avatar'] = optimize_cloudinary_url(m['avatar'])
         return m
     except HTTPException:
@@ -406,9 +499,10 @@ def get_meetup(meetup_id: str):
                 database_id, RESERVATIONS_COLLECTION,
                 [Query.equal('meetup_id', meetup_id)]
             )
+            valid_docs = [doc for doc in get_docs(res) if (as_dict(doc).get('data', as_dict(doc))).get('ticket_id') != 'REJECTED']
             total_seats = sum(
                 (as_dict(doc).get('data', as_dict(doc))).get('quantity', 1)
-                for doc in get_docs(res)
+                for doc in valid_docs
             )
             meetup['registered_count'] = total_seats
             meetup['remaining'] = max(0, meetup['capacity'] - total_seats)
@@ -493,11 +587,27 @@ def get_pending_reservations(request_admin_email: str = ""):
 @app.get("/api/reservations/{meetup_id}")
 def get_reservations(meetup_id: str):
     try:
-        response = databases.list_documents(
-            database_id, RESERVATIONS_COLLECTION,
-            [Query.equal('meetup_id', meetup_id)]
-        )
-        return [doc_to_reservation(doc) for doc in get_docs(response)]
+        results = []
+        queries = [Query.equal('meetup_id', meetup_id), Query.limit(100)]
+        while True:
+            response = databases.list_documents(
+                database_id, RESERVATIONS_COLLECTION, queries
+            )
+            docs = get_docs(response)
+            if not docs:
+                break
+            
+            # Filter out pending and rejected reservations
+            for doc in docs:
+                r = doc_to_reservation(doc)
+                if r['status'] not in ('pending_payment', 'rejected'):
+                    results.append(r)
+                    
+            if len(docs) < 100:
+                break
+            queries = [Query.equal('meetup_id', meetup_id), Query.limit(100), Query.cursorAfter(docs[-1]['$id'])]
+                
+        return results
     except Exception as e:
         return []
 
@@ -528,6 +638,22 @@ class TicketScanRequest(BaseModel):
     ticket_id: str
     action: str = "check_in"  # "check_in" | "check_out"
 
+class ReservationStatusUpdate(BaseModel):
+    status: str
+
+@app.put("/api/reservations/{reservation_id}/status")
+def update_reservation_status(reservation_id: str, payload: ReservationStatusUpdate):
+    try:
+        is_checked_in = payload.status == 'checked_in'
+        updated_doc = databases.update_document(
+            database_id,
+            RESERVATIONS_COLLECTION,
+            reservation_id,
+            {'checked_in': is_checked_in}
+        )
+        return doc_to_reservation(updated_doc)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/tickets/scan")
 def scan_ticket(req: TicketScanRequest):
@@ -712,9 +838,19 @@ def create_reservation(res: ReservationCreate):
             database_id, RESERVATIONS_COLLECTION,
             [Query.equal('meetup_id', res.meetup_id)]
         )
+        valid_existing = [d for d in get_docs(existing) if (as_dict(d).get('data', as_dict(d))).get('ticket_id') != 'REJECTED']
+        
+        # Prevent duplicate registrations
+        user_already_registered = any(
+            (as_dict(d).get('data', as_dict(d))).get('user_email') == res.user_email
+            for d in valid_existing
+        )
+        if user_already_registered:
+            raise HTTPException(status_code=400, detail="You have already registered for this meetup.")
+
         total_booked = sum(
             (as_dict(d).get('data', as_dict(d))).get('quantity', 1)
-            for d in get_docs(existing)
+            for d in valid_existing
         )
         if total_booked + res.quantity > capacity:
             raise HTTPException(status_code=400, detail="Not enough seats remaining.")
@@ -786,7 +922,7 @@ def approve_reservation(reservation_id: str):
 
         updated_doc = databases.update_document(
             database_id, RESERVATIONS_COLLECTION, reservation_id,
-            {'status': 'confirmed', 'ticket_id': ticket_id}
+            {'ticket_id': ticket_id}
         )
 
         # Send confirmation email
