@@ -23,7 +23,7 @@ share/python-wheels/
 
 # Virtual Environment
 venv/
-env/
+.env/
 ENV/
 env.bak/
 venv.bak/
